@@ -3,10 +3,11 @@ import sqlite3
 import os
 import time
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+import threading
 
 load_dotenv()
 
@@ -27,9 +28,17 @@ CREATE TABLE IF NOT EXISTS faces (
     first_seen TIMESTAMP,
     last_seen TIMESTAMP,
     total_time INTEGER,
-    alert_sent INTEGER DEFAULT 0
+    alert_sent INTEGER DEFAULT 0,
+    face_image BLOB,
+    face_encoding BLOB
 )
 ''')
+
+try:
+    cursor.execute('ALTER TABLE faces ADD COLUMN face_image BLOB')
+except:
+    pass
+
 conn.commit()
 
 face_trackers = {}
@@ -53,6 +62,50 @@ def calculate_iou(box1, box2):
         return 0
     
     return inter_area / union_area
+
+def get_face_features(face_image):
+    gray_face = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+    gray_face = cv2.resize(gray_face, (100, 100))
+    
+    hist = cv2.calcHist([gray_face], [0], None, [256], [0, 256])
+    hist = cv2.normalize(hist, hist).flatten()
+    
+    lbp = cv2.calcHist([gray_face], [0], None, [256], [0, 256])
+    lbp = cv2.normalize(lbp, lbp).flatten()
+    
+    features = np.concatenate([hist, lbp])
+    return features
+
+def compare_faces(features1, features2, threshold=0.7):
+    if features1 is None or features2 is None:
+        return False
+    
+    correlation = cv2.compareHist(features1[:256].reshape(256, 1).astype(np.float32), 
+                                   features2[:256].reshape(256, 1).astype(np.float32), 
+                                   cv2.HISTCMP_CORREL)
+    
+    if correlation > threshold:
+        return True
+    
+    diff = np.abs(features1 - features2)
+    similarity = 1.0 - np.mean(diff)
+    
+    return similarity > threshold
+
+def match_face_in_db(face_features):
+    cursor.execute('SELECT face_id, face_image FROM faces WHERE face_image IS NOT NULL')
+    known_faces = cursor.fetchall()
+    
+    for face_id, stored_image_bytes in known_faces:
+        if stored_image_bytes:
+            nparr = np.frombuffer(stored_image_bytes, np.uint8)
+            stored_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if stored_image is not None and stored_image.size > 0:
+                stored_features = get_face_features(stored_image)
+                if compare_faces(face_features, stored_features):
+                    return face_id
+    return None
 
 def match_face_to_tracker(face_box, trackers, threshold=0.3):
     best_match = None
@@ -85,6 +138,26 @@ def put_text_ru(img, text, position, font_size, color_bgr, thickness):
     img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
     return img
 
+def send_telegram_message(text, chat_id=None):
+    if chat_id is None:
+        chat_id = TELEGRAM_ADMIN_ID
+    print(f"[TELEGRAM] Sending message to chat_id: {chat_id}")
+    print(f"[TELEGRAM] Message text: {text[:50]}...")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = {
+        'chat_id': chat_id,
+        'text': text
+    }
+    try:
+        response = requests.post(url, data=data, timeout=10)
+        print(f"[TELEGRAM] Response status: {response.status_code}")
+        if response.status_code != 200:
+            print(f"[TELEGRAM] Error response: {response.text}")
+        return response.status_code == 200
+    except Exception as e:
+        print(f"[TELEGRAM] Exception: {e}")
+        return False
+
 def send_telegram_photo(photo_path, face_id):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     
@@ -99,6 +172,153 @@ def send_telegram_photo(photo_path, face_id):
             return response.status_code == 200
         except:
             return False
+
+def get_statistics():
+    print("[STATS] Getting statistics...")
+    stats_conn = sqlite3.connect('faces.db')
+    stats_cursor = stats_conn.cursor()
+    
+    try:
+        now = datetime.now()
+        today_start = datetime(now.year, now.month, now.day, 0, 0, 0)
+        hour_start = datetime(now.year, now.month, now.day, now.hour, 0, 0)
+        
+        today_start_str = today_start.strftime('%Y-%m-%d %H:%M:%S')
+        hour_start_str = hour_start.strftime('%Y-%m-%d %H:%M:%S')
+        today_date_str = today_start.strftime('%Y-%m-%d')
+        
+        print(f"[STATS] Today start: {today_start_str}")
+        print(f"[STATS] Hour start: {hour_start_str}")
+        print(f"[STATS] Today date: {today_date_str}")
+        
+        stats_cursor.execute('SELECT COUNT(*) FROM faces')
+        total_faces = stats_cursor.fetchone()[0]
+        print(f"[STATS] Total faces in DB: {total_faces}")
+        
+        try:
+            stats_cursor.execute('''
+                SELECT COUNT(DISTINCT face_id) 
+                FROM faces 
+                WHERE strftime('%Y-%m-%d', first_seen) = ?
+            ''', (today_date_str,))
+            result = stats_cursor.fetchone()
+            print(f"[STATS] Daily query result: {result}")
+            daily_count = result[0] if result and result[0] is not None else 0
+            print(f"[STATS] Daily count: {daily_count}")
+            
+            if daily_count == 0:
+                stats_cursor.execute('''
+                    SELECT COUNT(DISTINCT face_id), MIN(first_seen), MAX(first_seen)
+                    FROM faces
+                ''')
+                debug_result = stats_cursor.fetchone()
+                print(f"[STATS] Debug - All faces: count={debug_result[0]}, min={debug_result[1]}, max={debug_result[2]}")
+                
+                stats_cursor.execute('''
+                    SELECT face_id, first_seen 
+                    FROM faces 
+                    LIMIT 5
+                ''')
+                sample_faces = stats_cursor.fetchall()
+                print(f"[STATS] Sample faces: {sample_faces}")
+        except Exception as e:
+            print(f"[STATS] Error in daily query: {e}")
+            import traceback
+            traceback.print_exc()
+            daily_count = 0
+        
+        try:
+            stats_cursor.execute('''
+                SELECT COUNT(DISTINCT face_id) 
+                FROM faces 
+                WHERE datetime(first_seen) >= datetime(?)
+            ''', (hour_start_str,))
+            result = stats_cursor.fetchone()
+            print(f"[STATS] Hourly query result: {result}")
+            hourly_count = result[0] if result and result[0] is not None else 0
+            print(f"[STATS] Hourly count: {hourly_count}")
+        except Exception as e:
+            print(f"[STATS] Error in hourly query: {e}")
+            import traceback
+            traceback.print_exc()
+            hourly_count = 0
+        
+        print(f"[STATS] Returning: daily={daily_count}, hourly={hourly_count}")
+        return daily_count, hourly_count
+    finally:
+        stats_conn.close()
+
+def check_telegram_commands():
+    print("[BOT] Starting Telegram commands checker...")
+    print(f"[BOT] Admin ID from env: {TELEGRAM_ADMIN_ID}")
+    print(f"[BOT] Bot token exists: {bool(TELEGRAM_BOT_TOKEN)}")
+    last_update_id = 0
+    
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {'offset': last_update_id + 1, 'timeout': 10}
+            print(f"[BOT] Requesting updates with offset: {last_update_id + 1}")
+            response = requests.get(url, params=params, timeout=15)
+            
+            print(f"[BOT] Response status: {response.status_code}")
+            if response.status_code == 200:
+                data = response.json()
+                print(f"[BOT] Response ok: {data.get('ok')}")
+                print(f"[BOT] Results count: {len(data.get('result', []))}")
+                
+                if data.get('ok') and data.get('result'):
+                    for update in data['result']:
+                        last_update_id = update['update_id']
+                        print(f"[BOT] Processing update_id: {last_update_id}")
+                        
+                        if 'message' in update:
+                            message = update['message']
+                            chat_id = message.get('chat', {}).get('id')
+                            print(f"[BOT] Received message from chat_id: {chat_id}")
+                            print(f"[BOT] Admin ID check: {str(chat_id)} == {str(TELEGRAM_ADMIN_ID)}")
+                            
+                            if str(chat_id) == str(TELEGRAM_ADMIN_ID):
+                                print("[BOT] Chat ID matches admin ID")
+                                if 'text' in message:
+                                    text = message['text'].strip()
+                                    print(f"[BOT] Command received: {text}")
+                                    
+                                    if text == '/start':
+                                        print("[BOT] Processing /start command")
+                                        welcome_text = "👋 Добро пожаловать!\n\n"
+                                        welcome_text += "Я бот для мониторинга системы распознавания лиц.\n\n"
+                                        welcome_text += "Доступные команды:\n"
+                                        welcome_text += "/stat - получить статистику посещений"
+                                        send_telegram_message(welcome_text, chat_id)
+                                    
+                                    elif text == '/stat':
+                                        print("[BOT] Processing /stat command")
+                                        daily, hourly = get_statistics()
+                                        stat_text = "📊 Статистика:\n\n"
+                                        stat_text += f"👥 За сегодня: {daily} человек\n"
+                                        stat_text += f"⏰ За последний час: {hourly} человек"
+                                        print(f"[BOT] Sending statistics: daily={daily}, hourly={hourly}")
+                                        send_telegram_message(stat_text, chat_id)
+                                else:
+                                    print("[BOT] Message has no text field")
+                            else:
+                                print(f"[BOT] Chat ID {chat_id} does not match admin ID {TELEGRAM_ADMIN_ID}")
+                        else:
+                            print("[BOT] Update has no message field")
+                else:
+                    print("[BOT] No results in response")
+            else:
+                print(f"[BOT] Bad response: {response.text}")
+        except Exception as e:
+            print(f"[BOT] Exception in check_telegram_commands: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        time.sleep(2)
+
+telegram_thread = threading.Thread(target=check_telegram_commands, daemon=True)
+telegram_thread.start()
 
 cap = cv2.VideoCapture(0)
 
@@ -127,21 +347,55 @@ while True:
             matched_id = match_face_to_tracker(face_box, face_trackers)
             
             if matched_id is None:
-                face_id = f"face_{next_face_id}"
-                next_face_id += 1
-                face_trackers[face_id] = {
-                    'first_seen': current_time,
-                    'last_seen': current_time,
-                    'last_box': face_box,
-                    'alert_sent': False
-                }
+                face_roi = frame[y:y+h, x:x+w]
                 
-                cursor.execute('''
-                    INSERT OR IGNORE INTO faces (face_id, first_seen, last_seen, total_time)
-                    VALUES (?, ?, ?, ?)
-                ''', (face_id, datetime.fromtimestamp(current_time), 
-                      datetime.fromtimestamp(current_time), 0))
-                conn.commit()
+                if face_roi.size > 0:
+                    face_features = get_face_features(face_roi)
+                    db_face_id = match_face_in_db(face_features)
+                    
+                    if db_face_id:
+                        face_id = db_face_id
+                        cursor.execute('SELECT first_seen, alert_sent FROM faces WHERE face_id = ?', (face_id,))
+                        result = cursor.fetchone()
+                        if result and result[0]:
+                            if isinstance(result[0], str):
+                                first_seen_dt = datetime.fromisoformat(result[0].replace('Z', '+00:00'))
+                            else:
+                                first_seen_dt = result[0]
+                            first_seen_time = first_seen_dt.timestamp()
+                            alert_sent = bool(result[1]) if result[1] is not None else False
+                        else:
+                            first_seen_time = current_time
+                            alert_sent = False
+                    else:
+                        face_id = f"face_{next_face_id}"
+                        next_face_id += 1
+                        first_seen_time = current_time
+                        alert_sent = False
+                        
+                        face_image_bytes = cv2.imencode('.jpg', face_roi)[1].tobytes()
+                        
+                        cursor.execute('''
+                            INSERT OR IGNORE INTO faces (face_id, first_seen, last_seen, total_time, face_image)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (face_id, datetime.fromtimestamp(current_time), 
+                              datetime.fromtimestamp(current_time), 0, face_image_bytes))
+                        conn.commit()
+                    
+                    if face_id not in face_trackers:
+                        face_trackers[face_id] = {
+                            'first_seen': first_seen_time,
+                            'last_seen': current_time,
+                            'last_box': face_box,
+                            'alert_sent': alert_sent
+                        }
+                    else:
+                        face_trackers[face_id]['last_seen'] = current_time
+                        face_trackers[face_id]['last_box'] = face_box
+                        if 'alert_sent' in locals():
+                            face_trackers[face_id]['alert_sent'] = alert_sent
+                    
+                    active_face_ids.add(face_id)
             else:
                 face_trackers[matched_id]['last_seen'] = current_time
                 face_trackers[matched_id]['last_box'] = face_box
@@ -197,7 +451,7 @@ while True:
     
     person_count = len(face_trackers)
     text = f"Людей в кадре: {person_count}"
-    frame = put_text_ru(frame, text, (10, 10), 24, (255, 255, 255), 2)
+    frame = put_text_ru(frame, text, (10, 10), 24, (0, 255, 255), 2)
     
     cv2.imshow('Face Detection', frame)
     
