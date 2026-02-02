@@ -6,6 +6,7 @@ import requests
 from datetime import datetime
 from dotenv import load_dotenv
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
@@ -65,6 +66,24 @@ def match_face_to_tracker(face_box, trackers, threshold=0.3):
             best_match = face_id
     
     return best_match
+
+def put_text_ru(img, text, position, font_size, color_bgr, thickness):
+    img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    
+    color_rgb = (color_bgr[2], color_bgr[1], color_bgr[0])
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except:
+        try:
+            font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", font_size)
+        except:
+            font = ImageFont.load_default()
+    
+    draw.text(position, text, font=font, fill=color_rgb)
+    img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    return img
 
 def send_telegram_photo(photo_path, face_id):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
@@ -173,12 +192,12 @@ while True:
             thickness = 2
         
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness)
-        cv2.putText(frame, f"{face_id} ({int(elapsed_time)}s)", 
-                   (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        text = f"{face_id} ({int(elapsed_time)}s)"
+        frame = put_text_ru(frame, text, (x, max(0, y - 20)), 16, color, 2)
     
     person_count = len(face_trackers)
-    cv2.putText(frame, f"Людей в кадре: {person_count}", (10, 30), 
-               cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    text = f"Людей в кадре: {person_count}"
+    frame = put_text_ru(frame, text, (10, 10), 24, (255, 255, 255), 2)
     
     cv2.imshow('Face Detection', frame)
     
