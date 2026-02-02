@@ -8,6 +8,11 @@ from dotenv import load_dotenv
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import threading
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from collections import defaultdict
 
 load_dotenv()
 
@@ -248,6 +253,117 @@ def get_statistics():
     finally:
         stats_conn.close()
 
+def generate_report():
+    print("[REPORT] Generating report...")
+    report_conn = sqlite3.connect('faces.db')
+    report_cursor = report_conn.cursor()
+    
+    try:
+        now = datetime.now()
+        today_start = datetime(now.year, now.month, now.day, 0, 0, 0)
+        today_date_str = today_start.strftime('%Y-%m-%d')
+        
+        report_cursor.execute('''
+            SELECT DISTINCT face_id, first_seen 
+            FROM faces 
+            WHERE strftime('%Y-%m-%d', first_seen) = ?
+            ORDER BY first_seen
+        ''', (today_date_str,))
+        
+        results = report_cursor.fetchall()
+        print(f"[REPORT] Found {len(results)} unique visits today")
+        
+        all_hours = []
+        for hour in range(24):
+            hour_dt = today_start.replace(hour=hour, minute=0, second=0, microsecond=0)
+            all_hours.append(hour_dt)
+        
+        hourly_visits = {h: 0 for h in all_hours}
+        
+        for row in results:
+            face_id, first_seen = row
+            visit_time = None
+            
+            if isinstance(first_seen, str):
+                try:
+                    if 'T' in first_seen or '+' in first_seen:
+                        visit_time = datetime.fromisoformat(first_seen.replace('Z', '+00:00'))
+                    else:
+                        visit_time = datetime.strptime(first_seen, '%Y-%m-%d %H:%M:%S')
+                except Exception as e:
+                    print(f"[REPORT] Error parsing date {first_seen}: {e}")
+                    try:
+                        visit_time = datetime.strptime(first_seen.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                    except:
+                        continue
+            elif isinstance(first_seen, datetime):
+                visit_time = first_seen
+            else:
+                print(f"[REPORT] Unknown date type: {type(first_seen)}, value: {first_seen}")
+                continue
+            
+            if visit_time:
+                hour_key = visit_time.replace(minute=0, second=0, microsecond=0)
+                if hour_key in hourly_visits:
+                    hourly_visits[hour_key] += 1
+                else:
+                    print(f"[REPORT] Hour {hour_key} not in range")
+        
+        hours = sorted(hourly_visits.keys())
+        counts = [hourly_visits[h] for h in hours]
+        
+        print(f"[REPORT] Total hours: {len(hours)}")
+        print(f"[REPORT] Total visits: {sum(counts)}")
+        print(f"[REPORT] Sample counts: {counts[:5]}...")
+        
+        fig, ax = plt.subplots(figsize=(14, 7))
+        
+        ax.bar(range(24), counts, color='#2E86AB', alpha=0.7, edgecolor='#1a5f7a', linewidth=1)
+        ax.plot(range(24), counts, marker='o', linewidth=2, markersize=6, color='#A23B72', label='Тренд')
+        
+        ax.set_title('Посещаемость по часам (сегодня)', fontsize=16, fontweight='bold', pad=20)
+        ax.set_xlabel('Час дня', fontsize=12)
+        ax.set_ylabel('Количество уникальных посетителей', fontsize=12)
+        ax.set_xticks(range(24))
+        ax.set_xticklabels([f'{h:02d}:00' for h in range(24)], rotation=45, ha='right')
+        ax.grid(True, alpha=0.3, linestyle='--', axis='y')
+        ax.legend()
+        
+        for i, count in enumerate(counts):
+            if count > 0:
+                ax.text(i, count + 0.1, str(count), ha='center', va='bottom', fontsize=9)
+        
+        plt.tight_layout()
+        
+        report_path = 'report.png'
+        plt.savefig(report_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"[REPORT] Report saved to {report_path}")
+        return report_path
+        
+    except Exception as e:
+        print(f"[REPORT] Error generating report: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+    finally:
+        report_conn.close()
+
+def send_telegram_document(file_path, chat_id):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    
+    with open(file_path, 'rb') as document:
+        files = {'document': document}
+        data = {'chat_id': chat_id}
+        try:
+            response = requests.post(url, files=files, data=data, timeout=30)
+            print(f"[TELEGRAM] Document response status: {response.status_code}")
+            return response.status_code == 200
+        except Exception as e:
+            print(f"[TELEGRAM] Exception sending document: {e}")
+            return False
+
 def check_telegram_commands():
     print("[BOT] Starting Telegram commands checker...")
     print(f"[BOT] Admin ID from env: {TELEGRAM_ADMIN_ID}")
@@ -289,7 +405,8 @@ def check_telegram_commands():
                                         welcome_text = "👋 Добро пожаловать!\n\n"
                                         welcome_text += "Я бот для мониторинга системы распознавания лиц.\n\n"
                                         welcome_text += "Доступные команды:\n"
-                                        welcome_text += "/stat - получить статистику посещений"
+                                        welcome_text += "/stat - получить статистику посещений\n"
+                                        welcome_text += "/report - график посещаемости за сегодня"
                                         send_telegram_message(welcome_text, chat_id)
                                     
                                     elif text == '/stat':
@@ -300,6 +417,20 @@ def check_telegram_commands():
                                         stat_text += f"⏰ За последний час: {hourly} человек"
                                         print(f"[BOT] Sending statistics: daily={daily}, hourly={hourly}")
                                         send_telegram_message(stat_text, chat_id)
+                                    
+                                    elif text == '/report':
+                                        print("[BOT] Processing /report command")
+                                        send_telegram_message("📈 Генерирую отчет...", chat_id)
+                                        report_path = generate_report()
+                                        if report_path and os.path.exists(report_path):
+                                            if send_telegram_document(report_path, chat_id):
+                                                print(f"[BOT] Report sent successfully")
+                                                if os.path.exists(report_path):
+                                                    os.remove(report_path)
+                                            else:
+                                                send_telegram_message("❌ Ошибка при отправке отчета", chat_id)
+                                        else:
+                                            send_telegram_message("❌ Нет данных для отчета за сегодня", chat_id)
                                 else:
                                     print("[BOT] Message has no text field")
                             else:
